@@ -38,6 +38,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trit_app import SearchEngine
 
+sys.path.insert(0, str(Path.home() / "OneDrive" / "Documents" / "mcp-gateway"))
+from wrap import make_gateway
+
 from mcp.server.fastmcp import FastMCP
 
 INDEX_DIR  = str(Path.home() / ".trit-search" / "index")
@@ -47,6 +50,13 @@ if not Path(MODEL_PATH).exists():
 
 mcp = FastMCP("observe")
 engine = SearchEngine()
+
+# Local-only audit log + rate limiting (see mcp-gateway/README-less package --
+# self-contained, single-operator scope; not wired into observe-api's separate
+# hosted commerce endpoints, which already have their own rate limiting).
+gated, _audit, _limiter = make_gateway(
+    "observe", str(Path.home() / ".trit-search" / "audit_log.jsonl"))
+_limiter.set_limit("apply_and_verify", 20)  # the one tool that writes real files -- tightest limit
 
 # ── Stable vs experimental tool surface ───────────────────────────────────────
 # The stable, benchmarked surface is search_code / query_codebase /
@@ -117,6 +127,7 @@ def _ensure_loaded():
         _loaded["error"] = f"Still loading after {TOTAL_LIMIT}s (last status: \"{_status['msg']}\") — try again shortly"
 
 @mcp.tool()
+@gated("search_code")
 def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
     """
     Search the local OBSERVE code index by meaning, not exact keywords.
@@ -169,6 +180,7 @@ def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
     return "\n".join(lines)
 
 @mcp.tool()
+@gated("query_codebase")
 def query_codebase(query: str, k: int = 8, project_dir: str = "") -> str:
     """
     Token-tight variant of search_code: same semantic search, but
@@ -251,6 +263,7 @@ def _call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 LOW_CONFIDENCE_THRESHOLD = 4.0   # below this top-score, treat search context as weak (see trit_cutoff_sweep_test.py for real score ranges)
 
 @experimental_tool
+@gated("propose_change")
 def propose_change(request: str, project_dir: str = "", model: str = OLLAMA_MODEL) -> str:
     """
     For a vague, ambiguous code-change request (e.g. "make turrets shoot
@@ -644,6 +657,7 @@ def _extract_current_state_pairs(text: str, window: int = 30) -> dict:
     return pairs
 
 @mcp.tool()
+@gated("index_status")
 def index_status() -> str:
     """
     Report the current OBSERVE index status — how many chunks/files are
@@ -694,6 +708,7 @@ def _git_revert_file(repo_root: Path, path: Path) -> bool:
         return False
 
 @experimental_tool
+@gated("apply_and_verify")
 def apply_and_verify(file_path: str, old_text: str, new_text: str) -> str:
     """
     Closes the loop that search_code/query_codebase/propose_change stop
@@ -845,6 +860,7 @@ def _load_entanglement_db():
         return None
 
 @experimental_tool
+@gated("list_indexed_projects")
 def list_indexed_projects() -> str:
     """
     List every distinct project OBSERVE's index has been mapped to, with
@@ -870,6 +886,7 @@ def list_indexed_projects() -> str:
     return "\n".join(lines)
 
 @experimental_tool
+@gated("get_project_summary")
 def get_project_summary(project_name: str) -> str:
     """
     Get the full summary and any flagged unsupported claims for one
@@ -908,6 +925,7 @@ def get_project_summary(project_name: str) -> str:
     return "\n".join(out)
 
 @experimental_tool
+@gated("get_entanglement")
 def get_entanglement(project_a: str, project_b: str) -> str:
     """
     Get the measured cross-project relationship between two projects from
