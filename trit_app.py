@@ -298,7 +298,8 @@ class SearchEngine:
                         preview = text[offset:offset+120].replace("\n", " ")
                     except Exception:
                         pass
-                    results.append({"score": float(score), "path": rel_path, "preview": preview, "offset": offset})
+                    results.append({"score": float(score), "path": rel_path, "preview": preview,
+                                     "offset": offset, "idx": int(idx)})
                 else:
                     # Legacy format fallback
                     results.append({
@@ -306,6 +307,7 @@ class SearchEngine:
                         "path":    m.get("rel_path", m.get("path", "?")),
                         "preview": m.get("preview", ""),
                         "offset":  m.get("offset"),
+                        "idx":     int(idx),
                     })
         return results
 

@@ -46,6 +46,10 @@ learn_debugger.py
 # OBSERVE's local index -- contains code/summaries indexed from THIS machine.
 # Publishing it would contradict OBSERVE's own promise that nothing leaves your machine.
 observe_full_database.json
+# chunk_provenance.py's output -- same reasoning as code_entanglement_db*.json above:
+# derived from this machine's index, bakes in real absolute paths, regenerate with
+# `python chunk_provenance.py --build` rather than publishing it.
+chunk_provenance.db
 # long run logs / stdout captures
 qwen_qat_long.txt
 qwen_qat_push.txt

@@ -179,6 +179,54 @@ def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
         lines.append(f"   {r['preview'][:150]}")
     return "\n".join(lines)
 
+@experimental_tool
+@gated("hybrid_search_code")
+def hybrid_search_code(query: str, k: int = 10, project: str = "", chunk_type: str = "",
+                        path_glob: str = "", expand_graph: bool = False) -> str:
+    """
+    search_code, extended with real structured filtering and optional
+    graph expansion over a provenance/lineage layer built alongside the
+    embedding index (see chunk_provenance.py). Results are still ranked
+    by the same semantic similarity search_code uses -- filtering narrows
+    the candidate set, it never re-ranks -- but each result now carries
+    real metadata (exact project, line range, chunk type) instead of a
+    bare path+preview, and can optionally show real call/import
+    relationships to OTHER chunks, not just text matches to the query.
+
+    Use this over search_code when you need to scope a search precisely
+    (e.g. "only in project X", "only function definitions, not stray
+    text/config") or when you want to see what a matched function calls
+    or is called by, which pure semantic similarity cannot surface (a
+    caller and callee can have zero textual/semantic overlap).
+
+    Args:
+        query: Natural-language description of what to find.
+        k: Number of results to return (default 10).
+        project: Optional exact project name to restrict to (see
+            list_indexed_projects for real names in this index).
+        chunk_type: Optional filter -- "function", "class", or "text"
+            (unclassified; currently only Python chunks get real
+            function/class tags from AST parsing).
+        path_glob: Optional glob (e.g. "*.py", "*test*") to restrict by
+            relative file path.
+        expand_graph: If true, attach each result's real 1-hop call/import
+            neighbors (Python-only; cross-project matches are tagged by
+            how confidently they were resolved -- see chunk_provenance.py).
+
+    Returns:
+        Formatted results with project/line-range/chunk-type per hit, and
+        real graph neighbors if expand_graph=True. Reports itself
+        unavailable (not an error) if `python chunk_provenance.py --build`
+        hasn't been run yet.
+    """
+    _ensure_loaded()
+    if _loaded["error"]:
+        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+    from hybrid_search import hybrid_search, format_results
+    result = hybrid_search(engine, query, k=k, project=project or None, chunk_type=chunk_type or None,
+                            path_glob=path_glob or None, expand_graph=expand_graph)
+    return format_results(result)
+
 @mcp.tool()
 @gated("query_codebase")
 def query_codebase(query: str, k: int = 8, project_dir: str = "") -> str:

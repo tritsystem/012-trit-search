@@ -100,10 +100,14 @@ The server exposes **three stable tools**:
 
 The three tools above are the product; they're benchmarked, and their
 failure modes are documented. The repo also contains experimental tools —
-`propose_change`, `apply_and_verify`, and the cross-project entanglement
+`propose_change`, `apply_and_verify`, the cross-project entanglement
 family (`list_indexed_projects`, `get_project_summary`,
-`get_entanglement`). **These are unstable and not part of the supported
-surface.** They stay unregistered unless you explicitly opt in:
+`get_entanglement`), and `hybrid_search_code` (real SQL structured
+filtering + optional 1-hop call/import graph expansion over a
+provenance/lineage layer -- see `chunk_provenance.py`; spot-checked
+against known real relationships, not yet benchmarked the way
+`query_codebase` was, so it stays experimental until it is).
+**These are unstable and not part of the supported surface.** They stay unregistered unless you explicitly opt in:
 
 ```bash
 OBSERVE_EXPERIMENTAL=1 python trit_mcp_server.py
