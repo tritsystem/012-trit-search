@@ -34,6 +34,7 @@ Usage:
 """
 import argparse
 import ast
+import bisect
 import hashlib
 import sqlite3
 import sys
@@ -70,6 +71,12 @@ CREATE TABLE IF NOT EXISTS edges (
     edge_type     TEXT NOT NULL,     -- 'imports' | 'defines' | 'calls'
     evidence      TEXT NOT NULL,     -- the real name/statement this edge was derived from
     resolution    TEXT NOT NULL,     -- 'same-file' | 'same-project' | 'name-match' | 'unresolved'
+    -- One row per distinct relationship, not one per AST occurrence -- a chunk with
+    -- many calls to the same name (real case: FL Studio plugin-parameter boilerplate,
+    -- dozens of PluginParameter(...) calls in a row landing in one 800-char chunk)
+    -- was writing a duplicate edge per occurrence before this constraint, drowning
+    -- hybrid_search's expand_graph output in redundant copies of the same edge.
+    UNIQUE(from_chunk_id, to_chunk_id, edge_type, evidence),
     FOREIGN KEY (from_chunk_id) REFERENCES chunks(chunk_id),
     FOREIGN KEY (to_chunk_id) REFERENCES chunks(chunk_id)
 );
@@ -212,19 +219,32 @@ def _tag_python_chunk_types_and_edges(conn, py_files):
         return rows
 
     file_chunks = {rp: chunks_for_file(rp) for rp in file_asts}
+    # Parallel line_start arrays for bisect -- rows are already ORDER BY
+    # line_start from the query above, so this is safe to build directly.
+    file_chunk_starts = {rp: [r[1] for r in rows] for rp, rows in file_chunks.items()}
 
     def chunk_for_line(rel_path, lineno):
         """The chunk whose [line_start, line_end] contains lineno, or the
         closest chunk if the file's chunking didn't align exactly (fixed-
-        size windows don't respect AST boundaries)."""
-        rows = file_chunks.get(rel_path) or []
-        best = None
-        for chunk_id, ls, le in rows:
-            if ls <= lineno <= le:
-                return chunk_id
-            if best is None or abs(ls - lineno) < abs(best[1] - lineno):
-                best = (chunk_id, ls)
-        return best[0] if best else None
+        size windows don't respect AST boundaries). O(log n) via bisect
+        over the file's chunks instead of a linear scan -- this is called
+        once per AST node of interest per file, and a large file can have
+        hundreds of chunks; matters as more repos get indexed over time."""
+        rows = file_chunks.get(rel_path)
+        if not rows:
+            return None
+        starts = file_chunk_starts[rel_path]
+        i = bisect.bisect_right(starts, lineno) - 1   # last chunk with line_start <= lineno
+        for j in (i, i + 1):                          # check the two bracketing candidates for real containment
+            if 0 <= j < len(rows):
+                chunk_id, ls, le = rows[j]
+                if ls <= lineno <= le:
+                    return chunk_id
+        candidates = [j for j in (i, i + 1) if 0 <= j < len(rows)]
+        if not candidates:
+            return rows[0][0]
+        best = min(candidates, key=lambda j: abs(rows[j][1] - lineno))
+        return rows[best][0]
 
     n_type = 0
     for rel_path, (src, tree) in file_asts.items():
@@ -246,19 +266,19 @@ def _tag_python_chunk_types_and_edges(conn, py_files):
                 for alias in node.names:
                     cid = chunk_for_line(rel_path, node.lineno)
                     if cid is not None:
-                        conn.execute(
-                            "INSERT INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
+                        cur = conn.execute(
+                            "INSERT OR IGNORE INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
                             "VALUES (?,?,?,?,?)",
                             (cid, cid, "imports", alias.name, "unresolved"))
-                        n_edges += 1
+                        n_edges += cur.rowcount   # 0 if a duplicate was silently ignored
             elif isinstance(node, ast.ImportFrom) and node.module:
                 cid = chunk_for_line(rel_path, node.lineno)
                 if cid is not None:
-                    conn.execute(
-                        "INSERT INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
                         "VALUES (?,?,?,?,?)",
                         (cid, cid, "imports", node.module, "unresolved"))
-                    n_edges += 1
+                    n_edges += cur.rowcount
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 called = node.func.id
                 caller_cid = chunk_for_line(rel_path, node.lineno)
@@ -280,11 +300,11 @@ def _tag_python_chunk_types_and_edges(conn, py_files):
                         n_skipped_ambiguous += 1
                         continue
                 for target_cid, target_path in targets:
-                    conn.execute(
-                        "INSERT INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
+                    cur = conn.execute(
+                        "INSERT OR IGNORE INTO edges (from_chunk_id, to_chunk_id, edge_type, evidence, resolution) "
                         "VALUES (?,?,?,?,?)",
                         (caller_cid, target_cid, "calls", called, resolution))
-                    n_edges += 1
+                    n_edges += cur.rowcount
     print(f"[provenance] {n_skipped_ambiguous} call site(s) skipped as too ambiguous "
           f"(name resolves to >{AMBIGUOUS_NAME_LIMIT} sites with no same-project match)")
     return n_type, n_edges

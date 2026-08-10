@@ -87,20 +87,24 @@ def hybrid_search(engine, query, k=10, project=None, chunk_type=None, path_glob=
     if expand_graph:
         for entry in filtered:
             cid = entry["idx"]
-            edges = conn.execute(
-                "SELECT edge_type, evidence, resolution, to_chunk_id FROM edges "
-                "WHERE from_chunk_id = ? AND to_chunk_id != from_chunk_id", (cid,)).fetchall()
+            # One JOINed, LIMITed query instead of an edges query + up to 10
+            # separate per-target lookups (a real N+1 pattern found while
+            # checking this for scalability) -- the LIMIT is in SQL, not a
+            # Python-side slice after fetching everything, so a real hub
+            # chunk with hundreds of edges doesn't pull them all into memory
+            # just to discard most of them.
+            rows = conn.execute(
+                "SELECT e.edge_type, e.evidence, e.resolution, "
+                "c.rel_path, c.line_start, c.project FROM edges e "
+                "JOIN chunks c ON c.chunk_id = e.to_chunk_id "
+                "WHERE e.from_chunk_id = ? AND e.to_chunk_id != e.from_chunk_id "
+                "LIMIT 10", (cid,)).fetchall()
             related = []
-            for e in edges[:10]:
-                target = conn.execute(
-                    "SELECT rel_path, line_start, project FROM chunks WHERE chunk_id = ?",
-                    (e["to_chunk_id"],)).fetchone()
-                if target is None:
-                    continue
+            for r in rows:
                 related.append({
-                    "edge_type": e["edge_type"], "evidence": e["evidence"], "resolution": e["resolution"],
-                    "target_path": target["rel_path"], "target_line": target["line_start"],
-                    "target_project": target["project"],
+                    "edge_type": r["edge_type"], "evidence": r["evidence"], "resolution": r["resolution"],
+                    "target_path": r["rel_path"], "target_line": r["line_start"],
+                    "target_project": r["project"],
                 })
             entry["related"] = related
 
