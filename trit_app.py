@@ -203,6 +203,7 @@ class SearchEngine:
     def load(self, index_dir, model_path, on_status):
         def _load():
             try:
+                on_status("Starting imports (sentence_transformers import alone takes ~55s on this machine)...")
                 import faiss
                 import numpy as np
                 from sentence_transformers import SentenceTransformer

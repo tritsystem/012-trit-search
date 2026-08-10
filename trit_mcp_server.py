@@ -80,11 +80,16 @@ def _ensure_loaded():
         _loaded["loading_started"] = True
 
     # engine.load() spawns a background daemon thread; block until ready
-    # for the synchronous tool call below. If the status hasn't moved in
-    # STALL_LIMIT seconds and we're still not ready, treat the load as
-    # stuck/dead rather than silently re-waiting forever: clear
-    # loading_started so the *next* call kicks off a fresh load thread.
-    STALL_LIMIT = 60
+    # for the synchronous tool call below. Measured real cost on this
+    # machine: `from sentence_transformers import SentenceTransformer`
+    # alone takes ~55s (heavy transformers/torch import chain), with no
+    # status update possible mid-import -- that's not a hang, so
+    # STALL_LIMIT must clear it with real margin. Only give up (and let
+    # the *next* call start a fresh thread) after TOTAL_LIMIT: the
+    # daemon thread is never cancelled, so resetting loading_started
+    # early would spawn a second concurrent load() on the same `engine`
+    # singleton, racing to assign self.model/self.index.
+    STALL_LIMIT = 150
     TOTAL_LIMIT = 180
     waited = 0.0
     last_seen_ts = _status["ts"]
@@ -94,14 +99,17 @@ def _ensure_loaded():
         if _status["ts"] != last_seen_ts:
             last_seen_ts = _status["ts"]
         elif time.monotonic() - last_seen_ts > STALL_LIMIT:
-            _loaded["loading_started"] = False
             _loaded["error"] = (
-                f"Load appears stalled (no progress for {STALL_LIMIT}s, "
-                f"last status: \"{_status['msg']}\"). Will retry on next call."
+                f"Load is slow (no status change for {STALL_LIMIT}s, "
+                f"last status: \"{_status['msg']}\") but the background "
+                f"thread is still running -- try again shortly rather than "
+                f"restarting."
             )
             return
 
     _loaded["done"] = engine.ready
+    if not engine.ready and waited >= TOTAL_LIMIT:
+        _loaded["loading_started"] = False
     if engine.ready:
         _loaded["error"] = None
     else:
