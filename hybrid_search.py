@@ -43,6 +43,14 @@ def hybrid_search(engine, query, k=10, project=None, chunk_type=None, path_glob=
     carries real provenance; expand_graph attaches each hit's real 1-hop
     call/import neighbors.
 
+    path_glob uses Path.match() semantics, which trips a real gotcha: a
+    single-segment pattern like "*Lessons*" only matches the FILENAME (the
+    last path component), not the full relative path -- to match everything
+    under a subdirectory, use a multi-segment pattern like "Lessons/*"
+    (matched against the string "Lessons\\file.md" too, on Windows).
+    Confirmed directly: "*Lessons*" against "Lessons/foo.md" -> False;
+    "Lessons/*" against the same path -> True.
+
     Returns {"available": False, "reason": ...} if the provenance DB
     hasn't been built yet -- caller should fall back to engine.search()
     directly rather than erroring."""

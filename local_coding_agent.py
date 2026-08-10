@@ -31,6 +31,7 @@ Usage:
 import argparse
 import json
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -61,15 +62,47 @@ outside the JSON. Available actions:
       refused. The file is verified to still compile after the edit; if it doesn't, the edit is
       automatically reverted via git. You will be told exactly what happened.
 
+  {{"action": "run_python", "args": {{"code": "..."}}}}
+      Execute a real, short Python snippet (via `python -c`, cwd = the repo root above, 15s
+      timeout) and see its REAL stdout/stderr/exit code. Use this to actually TEST your edit
+      behaves correctly -- propose_edit only checks that the file still COMPILES, it does NOT
+      confirm your fix does what you think it does. A syntax-valid edit can still be functionally
+      wrong (e.g. moving buggy code into a function that gets called unconditionally at import
+      time is NOT a fix -- verify by actually importing/running it, don't just assume wrapping
+      code in a function changes when it executes).
+
   {{"action": "done", "args": {{"summary": "what you did and why"}}}}
-      Finish. Only call this after you have actually verified your edit(s) succeeded.
+      Finish. Only call this AFTER you have used run_python to actually verify your edit produces
+      the correct real behavior, not just that it compiles. A summary claiming something works
+      that you have not actually tested is worse than admitting you couldn't fully verify it.
 
 Task: {task}
 
 Rules: search or read BEFORE proposing an edit -- never propose an edit to a file you have not
 actually read in this conversation. If propose_edit reports REFUSED or REVERTED, do not just retry
 blindly -- read the reason and adjust (e.g. read more context so old_text is unique, or fix the
-syntax issue that caused the revert). Keep edits small and targeted."""
+syntax issue that caused the revert). Keep edits small and targeted. ALWAYS run_python to verify
+behavior before calling done -- compiling is not the same as working."""
+
+
+def run_python(code, cwd, timeout=15):
+    """Real execution, not a syntax check -- this is what propose_edit's
+    py_compile step cannot give the agent: actual behavior. Scoped
+    deliberately narrower than a full shell (single `python -c` snippet,
+    cwd pinned to the repo root, hard timeout) rather than an open shell
+    action, since this is specifically for "does my edit actually work",
+    not general command execution."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=str(cwd),
+            capture_output=True, text=True, timeout=timeout
+        )
+        out = f"exit_code={result.returncode}\nstdout:\n{result.stdout[-1500:]}\nstderr:\n{result.stderr[-1500:]}"
+        return out
+    except subprocess.TimeoutExpired:
+        return f"TIMED OUT after {timeout}s -- the snippet is likely hanging (e.g. blocking on real I/O)."
+    except Exception as e:
+        return f"error running snippet: {e}"
 
 
 def _extract_json(text):
@@ -90,6 +123,46 @@ def _extract_json(text):
     return text  # let json.loads raise its own real error if nothing balanced was found
 
 
+def load_relevant_lessons(engine, task, k=3):
+    """Real "read past lessons before working" grounding, matching the
+    Spikeling vault's own stated design ("Everything the agents do is
+    logged here, and they read it back before working -- so past work and
+    past mistakes shape new work") -- this agent didn't actually do that
+    until now. Searched with project="Spikeling" + path_glob="Lessons/*"
+    (NOT "*Lessons*" -- Path.match() only checks the filename against a
+    single-segment pattern, confirmed directly; see hybrid_search.py's
+    docstring for the same gotcha noted where it was found).
+
+    Needs its OWN query refinement, not local_dispatch.py's refine_query()
+    -- that one is tuned for CODE search ("what file/function"), and
+    measured directly to produce the wrong kind of query here: for this
+    exact task it returned "event_scanner.py argv error handling" (still
+    surface-level, filename-anchored) which found nothing, while a
+    genuinely conceptual query ("wrapping buggy code in a function does
+    not defer execution timing") found this file's own new lesson at
+    score 7.16. Lessons are general PRINCIPLES, not code -- the query
+    needs to ask for the underlying pattern/mistake-class, not a
+    code-search-shaped phrase."""
+    concept_prompt = (
+        f"Task: \"{task}\"\n\n"
+        f"Forget code search for a moment. What GENERAL software-engineering concept, pattern, or "
+        f"class of mistake might a past project lesson about this task be titled around? Write ONE "
+        f"short phrase (5-10 words) describing the underlying PRINCIPLE, not the specific file/variable "
+        f"names involved. Reply with ONLY the phrase."
+    )
+    concept_query = call_ollama(concept_prompt).strip().strip('"')
+    res = hybrid_search(engine, concept_query, k=k, project="Spikeling", path_glob="Lessons/*")
+    if not res.get("available") or not res.get("results"):
+        return []
+    seen_paths, lessons = set(), []
+    for r in res["results"]:
+        if r["rel_path"] in seen_paths:
+            continue
+        seen_paths.add(r["rel_path"])
+        lessons.append(f"[{r['rel_path']}] {r['preview']}")
+    return lessons
+
+
 def run_agent(task, project, max_turns=MAX_TURNS_DEFAULT, verbose=True):
     root = PROJECT_ROOTS.get(project)
     if not root or not root.exists():
@@ -101,7 +174,16 @@ def run_agent(task, project, max_turns=MAX_TURNS_DEFAULT, verbose=True):
     if verbose:
         print(f"[engine] loaded ({time.time()-t0:.1f}s)")
 
-    system = SYSTEM_TEMPLATE.format(project=project, root=root, task=task)
+    lessons = load_relevant_lessons(engine, task)
+    if verbose:
+        print(f"[lessons] {len(lessons)} relevant vault lesson(s) found")
+    lessons_block = ""
+    if lessons:
+        lessons_block = ("\n\nRELEVANT PAST LESSONS from this project's vault (real prior mistakes -- "
+                          "read these before acting, they may directly apply to this task):\n" +
+                          "\n".join(f"- {l}" for l in lessons))
+
+    system = SYSTEM_TEMPLATE.format(project=project, root=root, task=task) + lessons_block
     history = [system]
     log = []
 
@@ -142,6 +224,9 @@ def run_agent(task, project, max_turns=MAX_TURNS_DEFAULT, verbose=True):
                 result_text = full.read_text(encoding="utf-8", errors="ignore")[:4000]
             except Exception as e:
                 result_text = f"error reading file: {e}"
+
+        elif kind == "run_python":
+            result_text = run_python(args.get("code", ""), root)
 
         elif kind == "propose_edit":
             full = str(root / args.get("path", ""))
