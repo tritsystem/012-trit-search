@@ -33,6 +33,7 @@ Usage (as an MCP server, e.g. in Claude Code's mcp config):
 import sys
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -75,56 +76,172 @@ import time
 
 _loaded = {"done": False, "error": None, "loading_started": False}
 _status = {"msg": "Not started", "ts": 0.0}
+_load_lock = threading.Lock()
+_pending = {"attempt": None}   # holds the one AttemptState currently "live"
+
+# Real measured root cause (2026-08-12, see paper/mcp_stall_findings.md):
+# a stuck load is NOT the ~55s sentence_transformers import chain running
+# slow -- py-spy attached to a genuinely-hung server process showed the
+# background thread parked at zero CPU inside importlib's create_module()
+# for faiss's native _swigfaiss.pyd, i.e. blocked *inside* the OS-level
+# LoadLibrary call itself, with amsi.dll/MpOav.dll (Windows Defender/AMSI)
+# loaded into the same process. That's a real native DLL-load stall (almost
+# certainly AV real-time-scan + Windows loader-lock interaction), not
+# anything this Python code is doing -- outside this codebase's control,
+# and NOT reproducible on demand (a warm AV scan cache makes a fresh
+# in-isolation re-import fast, which is why isolated repro attempts didn't
+# hang). What IS a real, fixable, in-codebase bug: once that native call
+# wedges, a Python thread blocked inside a C extension can never be killed
+# or interrupted from pure Python -- so the *previous* version of this
+# function derived "time since last status" from the module-level
+# _status["ts"], read fresh at the top of every call and compared to
+# whatever time had ALREADY elapsed. Once a real stall pushed that gap past
+# STALL_LIMIT once, every later call recomputed the same ever-growing gap,
+# hit the stall branch on its very first 0.5s poll, and returned WITHOUT
+# ever resetting loading_started -- so the server reported the exact same
+# "not ready" message forever, with no way to recover short of killing the
+# process (this is what actually produced the 2-day-stuck PID tonight).
+#
+# Fix, two parts:
+#  1) Track "time since last real progress" PER ATTEMPT, in an isolated
+#     AttemptState object captured by that attempt's own on_status closure
+#     -- not a shared module-level timestamp. This preserves the original
+#     (correct) intent of tolerating a load that's merely slow but still
+#     genuinely progressing (important: this machine's real processes can
+#     contend with each other, per tonight's multi-spawn observations, so
+#     "elapsed since attempt START" alone would falsely abandon a healthy
+#     but contended load -- measured and confirmed by testing with
+#     shrunk-down limits; verified this per-progress design tolerates it).
+#     Critically, this isolation also means that IF a leaked, abandoned,
+#     truly-wedged thread ever does unblock later and calls on_status, it
+#     only ever updates its OWN AttemptState -- it can never bleed into or
+#     reset a newer attempt's stall clock.
+#  2) On genuine abandonment, reset loading_started so the NEXT call starts
+#     a real fresh attempt on a brand-new SearchEngine() instance (never
+#     reusing the singleton) -- the old wedged thread is leaked (Python
+#     genuinely cannot kill a thread blocked in a C extension), but it only
+#     ever touches its own now-unreferenced engine object. The module-level
+#     `engine` is swapped in only once a load actually completes. _load_lock
+#     guards the check-and-start of a new attempt, also closing a real (if
+#     narrow) pre-existing race where two concurrent tool calls could both
+#     see loading_started=False and both start a load.
+#
+# Honest limit on (2), found via LIVE evidence, not theory: after deploying
+# this fix, py-spy on the actual live server showed a real, deeper wall --
+# the retried attempt's thread wasn't stuck in create_module like the first
+# one; it was blocked in importlib's _lock_unlock_module, waiting to acquire
+# CPython's own per-module-name import lock for `faiss`, which the FIRST,
+# still-wedged thread was still holding (it never got far enough to release
+# it). This is a real, unavoidable CPython constraint: import locks are
+# keyed by module name and shared process-wide, so ANY new thread that
+# tries to `import faiss` again -- no matter how many fresh SearchEngine
+# attempts we spawn -- will always queue behind the same lock a wedged
+# thread holds forever. Retrying within the same process literally cannot
+# out-run this specific failure mode; only killing the whole process (which
+# releases all its locks with it) can. So: MAX_SAME_PROCESS_RETRIES caps
+# how many times this process will spawn a fresh in-process attempt before
+# giving up on retrying at all and saying so plainly -- better than an
+# infinite chain of equally-doomed retries that only leak more zombie
+# threads while implying progress that can't actually happen.
+STALL_ABANDON_LIMIT = 150   # real seconds since this attempt's last progress
+                             # signal (not since it started) before treating
+                             # it as genuinely wedged rather than slow
+PER_CALL_WAIT_CAP = 180     # a single tool call blocks polling at most this
+                             # long before returning control to the caller
+MAX_SAME_PROCESS_RETRIES = 2   # after this many abandoned attempts, stop
+                                 # retrying in-process and say so honestly
+
+class _AttemptState:
+    __slots__ = ("engine", "last_progress_ts")
+    def __init__(self, engine):
+        self.engine = engine
+        self.last_progress_ts = time.monotonic()
+
+_retry_count = {"n": 0}
 
 def _ensure_loaded():
+    global engine
     if _loaded["done"]:
         return
-    if not _loaded["loading_started"]:
-        def on_status(msg):
-            _status["msg"] = msg
+
+    if _retry_count["n"] > MAX_SAME_PROCESS_RETRIES:
+        _loaded["error"] = (
+            f"Gave up after {_retry_count['n']} abandoned load attempts in "
+            f"this process -- real evidence (py-spy) shows retries queue "
+            f"behind CPython's own import lock for a module a still-wedged "
+            f"earlier thread holds forever, so more in-process retries "
+            f"cannot succeed. This server process needs to be restarted "
+            f"(kill it; your MCP client should respawn a clean one) -- "
+            f"this is not something a code-level retry can fix."
+        )
+        return
+
+    with _load_lock:
+        if not _loaded["loading_started"]:
+            new_engine = SearchEngine()
+            attempt = _AttemptState(new_engine)
+
+            def on_status(msg, _attempt=attempt):
+                _status["msg"] = msg
+                _status["ts"] = time.monotonic()
+                _attempt.last_progress_ts = time.monotonic()
+                print(f"[OBSERVE] {msg}", file=sys.stderr)
+
+            _status["msg"] = "Starting..."
             _status["ts"] = time.monotonic()
-            print(f"[OBSERVE] {msg}", file=sys.stderr)
-        _status["msg"] = "Starting..."
-        _status["ts"] = time.monotonic()
-        engine.load(INDEX_DIR, MODEL_PATH, on_status)
-        _loaded["loading_started"] = True
+            _pending["attempt"] = attempt
+            new_engine.load(INDEX_DIR, MODEL_PATH, on_status)
+            _loaded["loading_started"] = True
+            _loaded["error"] = None
 
-    # engine.load() spawns a background daemon thread; block until ready
-    # for the synchronous tool call below. Measured real cost on this
-    # machine: `from sentence_transformers import SentenceTransformer`
-    # alone takes ~55s (heavy transformers/torch import chain), with no
-    # status update possible mid-import -- that's not a hang, so
-    # STALL_LIMIT must clear it with real margin. Only give up (and let
-    # the *next* call start a fresh thread) after TOTAL_LIMIT: the
-    # daemon thread is never cancelled, so resetting loading_started
-    # early would spawn a second concurrent load() on the same `engine`
-    # singleton, racing to assign self.model/self.index.
-    STALL_LIMIT = 150
-    TOTAL_LIMIT = 180
-    waited = 0.0
-    last_seen_ts = _status["ts"]
-    while not engine.ready and waited < TOTAL_LIMIT:
+    attempt = _pending["attempt"]
+    candidate = attempt.engine
+    waited_this_call = 0.0
+    while not candidate.ready:
+        stalled_for = time.monotonic() - attempt.last_progress_ts
+        if stalled_for > STALL_ABANDON_LIMIT or waited_this_call >= PER_CALL_WAIT_CAP:
+            break
         time.sleep(0.5)
-        waited += 0.5
-        if _status["ts"] != last_seen_ts:
-            last_seen_ts = _status["ts"]
-        elif time.monotonic() - last_seen_ts > STALL_LIMIT:
-            _loaded["error"] = (
-                f"Load is slow (no status change for {STALL_LIMIT}s, "
-                f"last status: \"{_status['msg']}\") but the background "
-                f"thread is still running -- try again shortly rather than "
-                f"restarting."
-            )
-            return
+        waited_this_call += 0.5
 
-    _loaded["done"] = engine.ready
-    if not engine.ready and waited >= TOTAL_LIMIT:
-        _loaded["loading_started"] = False
-    if engine.ready:
-        _loaded["error"] = None
+    if candidate.ready:
+        with _load_lock:
+            engine = candidate   # atomic swap -- other tool calls read this global
+            _loaded["done"] = True
+            _loaded["error"] = None
+        return
+
+    stalled_for = time.monotonic() - attempt.last_progress_ts
+    if stalled_for > STALL_ABANDON_LIMIT:
+        # No progress signal for real, per-attempt-tracked seconds -- treat
+        # as genuinely wedged, not just slow. Give up on THIS attempt for
+        # good so the *next* call gets a real fresh try instead of
+        # repeating this same check forever (up to MAX_SAME_PROCESS_RETRIES).
+        with _load_lock:
+            _loaded["loading_started"] = False
+        _retry_count["n"] += 1
+        remaining = MAX_SAME_PROCESS_RETRIES - _retry_count["n"]
+        retry_note = (
+            f"the next call will start a fresh one ({remaining} more "
+            f"in-process retr{'y' if remaining == 1 else 'ies'} left before "
+            f"this server gives up and asks for a restart instead)."
+            if remaining > 0 else
+            "no in-process retries are left -- the NEXT call will report "
+            "that this server needs to be restarted."
+        )
+        _loaded["error"] = (
+            f"Load attempt has had no progress for {stalled_for:.0f}s (last "
+            f"status: \"{_status['msg']}\") -- treating it as genuinely "
+            f"wedged (likely a native DLL load blocked outside Python's "
+            f"control, e.g. AV real-time scanning interacting with the "
+            f"Windows loader lock -- see comment above), not just slow. "
+            f"Abandoning this attempt; {retry_note}"
+        )
     else:
-        _loaded["loading_started"] = False
-        _loaded["error"] = f"Still loading after {TOTAL_LIMIT}s (last status: \"{_status['msg']}\") — try again shortly"
+        _loaded["error"] = (
+            f"Still loading (no progress signal for {stalled_for:.0f}s, "
+            f"last status: \"{_status['msg']}\") -- try again shortly."
+        )
 
 @mcp.tool()
 @gated("search_code")
