@@ -43,6 +43,8 @@ Usage:
 """
 import argparse
 import gc
+import os
+import shutil
 import time
 
 import torch
@@ -75,9 +77,24 @@ to entire distributed systems spanning thousands of machines.
 """.strip()
 
 
+def materialize(module):
+    """Force accelerate to load real data for a module that's currently a
+    meta-device placeholder (disk/cpu-offloaded, not yet touched by a real
+    forward pass). Real fix for 'Tensor.item() cannot be called on meta
+    tensors' / LoftQ's 'Cannot copy out of meta tensor' -- accelerate's own
+    AlignDevicesHook.pre_forward() does exactly this materialization
+    internally before every real forward call (that's why Condition A's
+    forward pass worked fine with meta tensors present); we just need to
+    trigger it manually here since we're modifying weights directly, not
+    running a forward pass."""
+    if module.weight.device.type == "meta" and hasattr(module, "_hf_hook"):
+        module._hf_hook.pre_forward(module)
+
+
 def prune_ffn_magnitude(module, frac):
     if frac <= 0.0:
         return 0
+    materialize(module)
     with torch.no_grad():
         w = module.weight.data
         flat = w.abs().flatten()
@@ -91,6 +108,7 @@ def prune_ffn_magnitude(module, frac):
 
 
 def ternary_quantize_inplace(module, thresh=0.7):
+    materialize(module)
     with torch.no_grad():
         w = module.weight.data
         nonzero = w[w != 0]
@@ -110,6 +128,7 @@ def int4_quantize_inplace(module):
     tensor ends up holding what the model would actually see at int4
     precision, still stored in the original dtype for the forward pass."""
     import bitsandbytes.functional as bnbF
+    materialize(module)
     with torch.no_grad():
         w = module.weight.data
         orig_dtype = w.dtype
@@ -124,6 +143,92 @@ def int4_quantize_inplace(module):
 
 def is_ffn_linear(name, module):
     return isinstance(module, nn.Linear) and any(p in name for p in FFN_NAME_PARTS)
+
+
+# ── Raw-tensor variants for direct checkpoint surgery ──────────────────
+# The module-based functions above (materialize + modify a loaded,
+# accelerate-hook-managed nn.Linear) hit two real bugs: unbounded GPU
+# memory growth from repeatedly calling pre_forward() with no matching
+# release across 192 FFN layers (OOM'd at 20GB+ against an 8GB card), and
+# a device-mismatch crash when a manually CPU-placed tensor didn't match
+# what the hook's own bookkeeping expected for the next real forward pass.
+# These operate on plain tensors loaded straight from safetensors files --
+# no hooks, no meta-device placeholders, no device-tracking to fight.
+
+def prune_tensor_magnitude(tensor, frac):
+    if frac <= 0.0:
+        return 0
+    with torch.no_grad():
+        flat = tensor.abs().flatten()
+        k = int(flat.numel() * frac)
+        if k == 0:
+            return 0
+        thresh = torch.kthvalue(flat, k).values
+        mask = tensor.abs() > thresh
+        tensor.mul_(mask)
+        return int((~mask).sum().item())
+
+
+def ternary_quantize_tensor(tensor, thresh=0.7):
+    with torch.no_grad():
+        nonzero = tensor[tensor != 0]
+        if nonzero.numel() == 0:
+            return
+        scale = nonzero.abs().mean()
+        t = thresh * scale
+        trit = torch.where(tensor > t, torch.ones_like(tensor),
+               torch.where(tensor < -t, -torch.ones_like(tensor), torch.zeros_like(tensor)))
+        tensor.copy_((trit * scale).to(tensor.dtype))
+
+
+def int4_quantize_tensor(tensor):
+    import bitsandbytes.functional as bnbF
+    with torch.no_grad():
+        orig_dtype = tensor.dtype
+        orig_shape = tensor.shape
+        w_gpu = tensor.to(device=device, dtype=torch.float16).contiguous()
+        packed, quant_state = bnbF.quantize_4bit(w_gpu, quant_type="nf4")
+        dequant = bnbF.dequantize_4bit(packed, quant_state)
+        tensor.copy_(dequant.reshape(orig_shape).to(device="cpu", dtype=orig_dtype))
+        del w_gpu, packed, dequant
+        torch.cuda.empty_cache()
+
+
+def prune_and_quantize_checkpoint(src_dir, dst_dir, prune_frac, quant_mode):
+    """Process each safetensors shard directly, save a new checkpoint.
+    Copies non-weight files (config, tokenizer, index) unchanged."""
+    from safetensors.torch import load_file, save_file
+
+    os.makedirs(dst_dir, exist_ok=True)
+    all_files = os.listdir(src_dir)
+    shard_files = sorted(f for f in all_files if f.endswith(".safetensors"))
+    other_files = [f for f in all_files if not f.endswith(".safetensors")]
+
+    for f in other_files:
+        src = os.path.join(src_dir, f)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dst_dir, f))
+
+    total_zeroed = total_params = 0
+    t0 = time.time()
+    for i, shard_name in enumerate(shard_files):
+        tensors = load_file(os.path.join(src_dir, shard_name))
+        for name, tensor in tensors.items():
+            if tensor.ndim == 2 and any(p in name for p in FFN_NAME_PARTS):
+                total_params += tensor.numel()
+                total_zeroed += prune_tensor_magnitude(tensor, prune_frac)
+                if quant_mode == "ternary":
+                    ternary_quantize_tensor(tensor)
+                elif quant_mode == "int4":
+                    int4_quantize_tensor(tensor)
+        save_file(tensors, os.path.join(dst_dir, shard_name), metadata={"format": "pt"})
+        print(f"    shard {i+1}/{len(shard_files)} done ({time.time()-t0:.0f}s elapsed)")
+        del tensors
+        gc.collect()
+
+    sparsity = total_zeroed / total_params if total_params else 0.0
+    print(f"  checkpoint surgery done in {time.time()-t0:.0f}s, sparsity={sparsity*100:.1f}%")
+    return sparsity
 
 
 def compute_perplexity(model, tokenizer, text):
@@ -266,6 +371,15 @@ def run_condition_f_temporal_prune(model_path, offload_folder, train_steps=150, 
 
     model, tokenizer = load_model(model_path, offload_folder)
 
+    # Condition E prunes upfront, which materializes every FFN layer as a
+    # side effect before LoftQ ever touches them. F doesn't prune upfront
+    # (that's the whole point -- it's ramped during training), so LoftQ's
+    # own init would hit the same meta-tensor crash unless we force
+    # materialization explicitly first.
+    for name, module in model.named_modules():
+        if is_ffn_linear(name, module):
+            materialize(module)
+
     print("  Adding LoRA adapters with LoftQ init (int4)...")
     loftq_config = LoftQConfig(loftq_bits=4)
     lora_config = LoraConfig(
@@ -324,33 +438,35 @@ def run_condition_f_temporal_prune(model_path, offload_folder, train_steps=150, 
 
 
 def run_condition(model_path, offload_folder, label, prune_frac, quant_mode):
-    """quant_mode: None, 'ternary', or 'int4'. Fresh model load every time --
-    avoids stacked in-place edits and the cost of keeping a spare unmodified
-    copy of ~18B FFN params in RAM, which wouldn't fit anyway."""
+    """quant_mode: None, 'ternary', or 'int4'. When either is set, does
+    direct checkpoint surgery on the safetensors files first (real tensors,
+    no accelerate hooks involved -- see prune_and_quantize_checkpoint's
+    docstring for why the in-memory hook-based approach was replaced),
+    saves a temp modified checkpoint, loads THAT cleanly, measures, then
+    deletes the temp checkpoint before returning (each is ~55GB, only ever
+    one on disk at a time)."""
     print("\n" + "=" * 70)
     print(f"CONDITION: {label}")
     print("=" * 70)
-    model, tokenizer = load_model(model_path, offload_folder)
 
-    ffn_layers = [(n, m) for n, m in model.named_modules() if is_ffn_linear(n, m)]
-    total_zeroed = 0
-    total_params = 0
-    t0 = time.time()
-    for name, module in ffn_layers:
-        total_params += module.weight.numel()
-        total_zeroed += prune_ffn_magnitude(module, prune_frac)
-        if quant_mode == "ternary":
-            ternary_quantize_inplace(module)
-        elif quant_mode == "int4":
-            int4_quantize_inplace(module)
-    sparsity = total_zeroed / total_params if total_params else 0.0
+    ckpt_dir = None
+    load_path = model_path
+    sparsity = 0.0
     if prune_frac > 0 or quant_mode:
-        print(f"  modified {len(ffn_layers)} FFN layers in {time.time()-t0:.0f}s, sparsity={sparsity*100:.1f}%")
+        ckpt_dir = model_path.rstrip("/\\") + f"-tmp-{quant_mode or 'prune'}"
+        if os.path.exists(ckpt_dir):
+            shutil.rmtree(ckpt_dir)
+        sparsity = prune_and_quantize_checkpoint(model_path, ckpt_dir, prune_frac, quant_mode)
+        load_path = ckpt_dir
 
+    model, tokenizer = load_model(load_path, offload_folder)
     ppl, loss = compute_perplexity(model, tokenizer, EVAL_TEXT)
     print(f"  Perplexity: {ppl:.3f}  (loss={loss:.4f})")
-
     unload(model)
+
+    if ckpt_dir:
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+
     return ppl, loss, sparsity
 
 

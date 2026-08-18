@@ -149,8 +149,54 @@ whereas weight matrices cannot be similarly corrected without retraining.
    incrementally rather than all at once.
 3. **Larger model** — MiniLM-L6 has only 6 layers and 22M params. Larger
    transformers (L12, L24) have more representational redundancy and
-   recover better from quantization noise.
+   recover better from quantization noise. **Tested below at 27B (1225x
+   larger) — this hypothesis is FALSIFIED, see next section.**
 4. **Domain-specific training data** — the QAT run used locally-extracted
    function-body pairs, which are noisy and short. Higher-quality contrastive
    pairs (with genuine hard negatives) would give the model a cleaner gradient
    signal to work with during the critical ternary warmup phase.
+
+---
+
+## Follow-up: Qwen3.8-27B (2026-08-18) — scale does NOT rescue ternary PTQ
+
+Directly tests hypothesis #3 above at real scale: prune 30% of FFN weights
+(magnitude-based) then quantize survivors, on Qwen3.8-27B (26.9B params,
+1225x larger than code-minilm), measuring real perplexity on a fixed
+held-out text sample. `012-ternary/qwen27b_prune_ternary_test.py` +
+`run_all.py`.
+
+| Condition | Perplexity | vs baseline | Sparsity |
+|---|---|---|---|
+| A) baseline bf16 | 3.823 | — | 0% |
+| B) prune 30% FFN only | 3.979 | +4.1% | 30.1% |
+| **C) prune 30% + ternary quantize survivors** | **4738.863** | **+123,850%** | 30.1% |
+| **D) prune 30% + int4 (NF4) quantize survivors** | **4.050** | **+5.9%** | 30.1% |
+
+**Hypothesis #3 (larger model recovers better) is falsified, decisively.**
+At 27B params, ternary PTQ is not just broken, it's *more* catastrophic in
+relative terms than at 22M params (a total collapse to garbage-level loss
+8.46, versus the original's -45pp accuracy drop — still bad, but bounded).
+More representational redundancy did not help; if anything the larger
+model had further to fall.
+
+**Real new result, not in the original test**: **int4 survives PTQ with no
+retraining at all** — 5.9% perplexity cost, nearly identical to pruning
+alone (4.1%). This wasn't tested in the original three-option sweep (which
+only validated INT8 as safe). Informed by DeepSeek V4's real production
+choice to use FP4 (16 levels) as their most aggressive precision and never
+go as low as ternary (3 levels) — this result is consistent with that
+choice being a genuine precision floor, not just conservatism. int4 sits
+between INT8 (proven safe, 4x compression) and ternary (proven catastrophic,
+29.7x compression) — a real, usable middle ground with ~8x compression that
+this project hadn't validated until now.
+
+**Real engineering finding along the way**: modifying weights in a
+disk-offloaded (`accelerate` `device_map="auto"`) loaded model directly
+doesn't work reliably — hit a meta-tensor crash (weights aren't
+materialized until touched by a real forward pass), then after fixing that,
+unbounded GPU memory growth (repeated manual materialization with no
+release) and a device-mismatch crash from fighting the hook's own
+placement bookkeeping. The robust fix: process the raw safetensors shard
+files directly on disk (plain tensors, no hooks, no meta placeholders),
+save a new checkpoint, then load that cleanly through the normal path.
