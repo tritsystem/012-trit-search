@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # OBSERVE - one-line installer (macOS / Linux)
 #
-#   curl -fsSL https://raw.githubusercontent.com/gbranaa4-hue/012-trit-search/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tritsystem/012-trit-search/project/install.sh | bash
 #
 # Installs into an isolated venv (~/.observe) so it never touches your system
 # Python, then puts `observe`, `observe-search`, and `observe-mcp` on your PATH.
 # Nothing leaves your machine; the only downloads are PyPI packages + the model.
 set -euo pipefail
 
-REPO="https://github.com/gbranaa4-hue/012-trit-search.git"
+REPO="https://github.com/tritsystem/012-trit-search.git"
 INSTALL_DIR="${OBSERVE_HOME:-$HOME/.observe}"
 VENV="$INSTALL_DIR/venv"
 BIN_DIR="$HOME/.local/bin"
@@ -45,7 +45,7 @@ say "Upgrading pip..."
 say "Installing CPU-only PyTorch (~180MB, one time)..."
 "$PIP" install --quiet torch --index-url https://download.pytorch.org/whl/cpu
 say "Installing OBSERVE + dependencies..."
-"$PIP" install --quiet "git+$REPO"
+"$PIP" install --quiet "git+$REPO@project"
 
 # 4. Expose the commands on PATH ---------------------------------------------
 mkdir -p "$BIN_DIR"

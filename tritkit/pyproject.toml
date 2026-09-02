@@ -14,7 +14,7 @@ keywords = ["ternary", "quantization", "QAT", "edge", "tinyml", "neural-network"
 dependencies = ["torch>=2.0", "numpy>=1.23"]
 
 [project.urls]
-Homepage = "https://github.com/gbranaa4-hue"
+Homepage = "https://github.com/tritsystem"
 
 # flat layout: the package files live directly in this directory (tritkit/),
 # so map the `tritkit` package to "." and its subpackage to "bench".

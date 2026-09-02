@@ -58,8 +58,8 @@ between rank preservation and the weighted advantage of rho=+0.44
 
 All experiments pre-registered their predictions in the code before
 running; negative and weak results are reported alongside positive ones.
-Complete reproducible code is public (github.com/gbranaa4-hue/012-trit-search
-and github.com/gbranaa4-hue/Spikeling).
+Complete reproducible code is public (github.com/tritsystem/012-trit-search
+and github.com/tritsystem/Spikeling).
 
 RELATED IDENTIFIERS (add if the symmetry preprint is published first):
   "is supplemented by" → the 012-trit-search GitHub repository URL

@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/gbranaa4-hue/012-trit-search"
-Documentation = "https://github.com/gbranaa4-hue/012-trit-search/blob/master/OBSERVE.md"
+Homepage = "https://github.com/tritsystem/012-trit-search"
+Documentation = "https://github.com/tritsystem/012-trit-search/blob/master/OBSERVE.md"
 
 [project.scripts]
 observe = "trit_app:main"

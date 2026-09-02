@@ -1,12 +1,12 @@
 # OBSERVE - one-line installer (Windows)
 #
-#   irm https://raw.githubusercontent.com/gbranaa4-hue/012-trit-search/master/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/tritsystem/012-trit-search/project/install.ps1 | iex
 #
 # Installs into an isolated venv (%USERPROFILE%\.observe) and registers the
 # `observe`, `observe-search`, and `observe-mcp` commands on your PATH.
 $ErrorActionPreference = "Stop"
 
-$Repo       = "git+https://github.com/gbranaa4-hue/012-trit-search.git"
+$Repo       = "git+https://github.com/tritsystem/012-trit-search.git@project"
 $InstallDir = if ($env:OBSERVE_HOME) { $env:OBSERVE_HOME } else { Join-Path $HOME ".observe" }
 $Venv       = Join-Path $InstallDir "venv"
 $Scripts    = Join-Path $Venv "Scripts"
