@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OBSERVE - one-line installer (macOS / Linux)
 #
-#   curl -fsSL https://raw.githubusercontent.com/tritsystem/012-trit-search/project/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/tritsystem/012-trit-search/main/install.sh | bash
 #
 # Installs into an isolated venv (~/.observe) so it never touches your system
 # Python, then puts `observe`, `observe-search`, and `observe-mcp` on your PATH.
@@ -45,7 +45,7 @@ say "Upgrading pip..."
 say "Installing CPU-only PyTorch (~180MB, one time)..."
 "$PIP" install --quiet torch --index-url https://download.pytorch.org/whl/cpu
 say "Installing OBSERVE + dependencies..."
-"$PIP" install --quiet "git+$REPO@project"
+"$PIP" install --quiet "git+$REPO"
 
 # 4. Expose the commands on PATH ---------------------------------------------
 mkdir -p "$BIN_DIR"

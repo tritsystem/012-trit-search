@@ -25,11 +25,11 @@ This repo contains real, measured, reproducible results — both positive and ne
 
 **macOS / Linux:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tritsystem/012-trit-search/project/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/tritsystem/012-trit-search/main/install.sh | bash
 ```
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/tritsystem/012-trit-search/project/install.ps1 | iex
+irm https://raw.githubusercontent.com/tritsystem/012-trit-search/main/install.ps1 | iex
 ```
 
 Installs into an isolated venv (`~/.observe`) — never touches your system Python — and
@@ -44,7 +44,7 @@ observe-mcp        # MCP server for editors / coding agents
 First run downloads ~300–500 MB one time (CPU PyTorch + the embedding model). Everything
 after that is fully local — nothing leaves your machine. Requires Python 3.10+.
 
-> Prefer pip? `pipx install "git+https://github.com/tritsystem/012-trit-search.git@project"`
+> Prefer pip? `pipx install "git+https://github.com/tritsystem/012-trit-search.git"`
 
 ## Develop / run the full research project
 

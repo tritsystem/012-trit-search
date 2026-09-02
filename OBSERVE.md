@@ -31,7 +31,7 @@ correctly on its own.
 ## Install + demo, one line
 
 ```bash
-pip install "git+https://github.com/tritsystem/012-trit-search.git@project" && observe-demo
+pip install "git+https://github.com/tritsystem/012-trit-search.git" && observe-demo
 ```
 
 That installs OBSERVE, indexes the directory you ran it from into a
