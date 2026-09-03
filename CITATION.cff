@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use OBSERVE or the 012-ternary research, please cite it as below."
+title: "OBSERVE / 012-ternary: local semantic code search and ternary-computing research"
+abstract: >-
+  A research and tooling project on ternary computing ({-1, 0, +1}), from
+  SystemVerilog RTL through a balanced-ternary CPU emulator to OBSERVE, a local,
+  private semantic code-search tool (desktop app, CLI, and MCP server). Includes
+  measured positive and negative results and a six-study scoping-rule ladder.
+type: software
+authors:
+  - family-names: Branaa
+    given-names: Gavin
+    email: gbranaa4@gmail.com
+repository-code: "https://github.com/tritsystem/012-trit-search"
+url: "https://github.com/tritsystem/012-trit-search"
+license: MIT
+version: 1.0.0
+date-released: 2026-09-03
+keywords:
+  - ternary computing
+  - semantic code search
+  - model context protocol
+  - reservoir computing
+  - reproducible research

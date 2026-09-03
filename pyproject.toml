@@ -4,12 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "observe-search"
-version = "0.1.0"
+version = "1.0.0"
 description = "OBSERVE - local semantic code search: desktop app, CLI, and MCP server. Nothing leaves your machine."
 readme = "OBSERVE.md"
 license = { text = "MIT" }
-authors = [{ name = "Gavin Branaa" }]
+authors = [{ name = "Gavin Branaa", email = "gbranaa4@gmail.com" }]
 requires-python = ">=3.10"
+keywords = ["code search", "semantic search", "mcp", "embeddings", "ternary", "local-first", "privacy"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Indexing",
+]
 dependencies = [
     "sentence-transformers",
     "faiss-cpu",
@@ -20,9 +31,15 @@ dependencies = [
     "numpy",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
 [project.urls]
 Homepage = "https://github.com/tritsystem/012-trit-search"
-Documentation = "https://github.com/tritsystem/012-trit-search/blob/master/OBSERVE.md"
+Documentation = "https://github.com/tritsystem/012-trit-search/blob/main/OBSERVE.md"
+Repository = "https://github.com/tritsystem/012-trit-search"
+Issues = "https://github.com/tritsystem/012-trit-search/issues"
+Changelog = "https://github.com/tritsystem/012-trit-search/blob/main/CHANGELOG.md"
 
 [project.scripts]
 observe = "trit_app:main"

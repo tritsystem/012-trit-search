@@ -55,3 +55,7 @@ qwen_qat_long.txt
 qwen_qat_push.txt
 run_full_pipeline_output.txt
 trit_grow_run2.txt
+
+# scratch: MCP call transcripts / init dumps
+mcp_*.jsonl
+*.jsonl
