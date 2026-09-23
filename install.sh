@@ -43,7 +43,7 @@ PIP="$VENV/bin/pip"
 say "Upgrading pip..."
 "$PIP" install --upgrade --quiet pip
 say "Installing CPU-only PyTorch (~180MB, one time)..."
-"$PIP" install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+"$PIP" install --quiet torch --extra-index-url https://download.pytorch.org/whl/cpu
 say "Installing OBSERVE + dependencies..."
 "$PIP" install --quiet "git+$REPO"
 

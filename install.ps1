@@ -41,7 +41,7 @@ $Pip = Join-Path $Scripts "pip.exe"
 Write-Host "  Upgrading pip..."
 & $Pip install --upgrade --quiet pip
 Write-Host "  Installing CPU-only PyTorch (~180MB, one time)..."
-& $Pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+& $Pip install --quiet torch --extra-index-url https://download.pytorch.org/whl/cpu
 Write-Host "  Installing OBSERVE + dependencies..."
 & $Pip install --quiet $Repo
 
