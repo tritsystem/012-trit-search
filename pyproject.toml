@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "observe-search"
-version = "1.0.0"
+version = "1.0.1"
 description = "OBSERVE - local semantic code search: desktop app, CLI, and MCP server. Nothing leaves your machine."
 readme = "OBSERVE.md"
 license = { text = "MIT" }
