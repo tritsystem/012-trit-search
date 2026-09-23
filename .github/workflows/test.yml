@@ -36,7 +36,11 @@ jobs:
 
       - name: Unit tests
         run: |
-          python -m pytest -q test_decision_arbitration.py test_ternary_qwen.py
+          # test_ternary_qwen.py is a manual research script that downloads and runs a
+          # real 7B-parameter model end to end -- not a CI-appropriate automated test
+          # (no GPU on this runner, minutes-to-hours on CPU, multi-GB download). It is
+          # meant to be run by hand, not in this workflow.
+          python -m pytest -q test_decision_arbitration.py
 
       - name: Lint (non-blocking)
         run: |

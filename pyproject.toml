@@ -26,7 +26,7 @@ dependencies = [
     "faiss-cpu",
     "flask",
     "torch",
-    "mcp",
+    "mcp<2",  # trit_mcp_server.py uses the v1 FastMCP API; mcp 2.x renamed it to MCPServer
     "tiktoken",
     "numpy",
 ]

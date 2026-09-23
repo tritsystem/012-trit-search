@@ -38,9 +38,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trit_app import SearchEngine
+from observe_pipeline import group_chunks_by_project, NON_PROJECT_HINTS
 
-sys.path.insert(0, str(Path.home() / "OneDrive" / "Documents" / "mcp-gateway"))
-from wrap import make_gateway
+try:
+    # mcp-gateway is a separate, shared local package (also used by Spikeling's MCP
+    # server) -- not published anywhere, so it is genuinely optional: importing this
+    # module (and running the server) must work without it, for CI, for a fresh
+    # `pip install`, and for anyone whose machine doesn't have a sibling mcp-gateway
+    # checkout. When it IS present, real audit logging + rate limiting apply.
+    sys.path.insert(0, str(Path.home() / "OneDrive" / "Documents" / "mcp-gateway"))
+    from wrap import make_gateway
+except ImportError:
+    def make_gateway(server_name, audit_path, default_rate_per_min=60):
+        class _NoopLimiter:
+            def set_limit(self, *a, **kw):
+                pass
+
+        def gated(tool_name, rate_per_min=None):
+            def deco(fn):
+                return fn
+            return deco
+
+        return gated, None, _NoopLimiter()
 
 from mcp.server.fastmcp import FastMCP
 
@@ -1028,27 +1047,74 @@ def _load_entanglement_db():
 @gated("list_indexed_projects")
 def list_indexed_projects() -> str:
     """
-    List every distinct project OBSERVE's index has been mapped to, with
-    chunk counts and (if the entanglement database has been built) a
-    one-line summary of what each project is. Reads from the precomputed
-    database written by trit_entanglement.py — does NOT recompute live,
-    since building it involves many local-model calls and takes tens of
-    minutes. Run `python trit_entanglement.py` first if this returns
-    "no database found."
+    List every distinct project OBSERVE's index has been mapped to.
+
+    REAL BUG THIS FIXES (2026-09-14): this tool used to read ONLY the
+    precomputed entanglement database (code_entanglement_db.json, written
+    by trit_entanglement.py) and report just that. That database is built
+    by many local-model (Ollama) summarization calls and takes tens of
+    minutes, so it is NOT rebuilt automatically after
+    observe_incremental_index.py + chunk_provenance.py --build add new
+    projects to the live index -- it silently goes stale. Concretely: a
+    real matomo-security-audit sweep found this tool reporting that
+    NEITHER matomo nor zabbix were indexed, when both genuinely were
+    (verified directly against chunk_provenance.db) -- a confident wrong
+    answer with no warning that anything was stale.
+
+    Fix: project names + chunk counts now always come from the LIVE,
+    currently-loaded embedding index via group_chunks_by_project() (the
+    same cheap, in-memory grouping chunk_provenance.py itself uses to
+    assign each chunk's project) -- this can never be stale relative to
+    what OBSERVE can actually search right now, since it IS what OBSERVE
+    searches. The entanglement database, if present, is merged in
+    read-only for its one piece of value the live index can't provide (an
+    LLM-generated one-line summary per project) -- any project the live
+    index has that the entanglement DB doesn't know about yet is now
+    listed with an explicit "[not summarized -- entanglement DB is stale
+    or was never built for this project]" flag instead of being silently
+    omitted or misreported. There is currently no automatic trigger to
+    rebuild the entanglement DB after indexing (its cost, tens of minutes
+    of LLM calls, makes that unsafe to run implicitly inside an MCP tool
+    call) -- run `python trit_entanglement.py` manually after adding new
+    projects if you want fresh summaries; this tool's core answer (what's
+    indexed, how much) no longer depends on that step being done.
 
     Returns:
-        One line per project: name, chunk count, and summary if available.
+        One line per project: name, LIVE chunk count, and an entanglement
+        summary if one exists and is current -- otherwise a visible
+        "[not summarized]" flag rather than a wrong or missing answer.
     """
+    _ensure_loaded()
+    if _loaded["error"]:
+        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+
+    live_groups = group_chunks_by_project(engine)
+    live_counts = {name: len(idxs) for name, idxs in live_groups.items()}
+
     db = _load_entanglement_db()
-    if db is None:
-        return ("No entanglement database found. Run `python trit_entanglement.py` "
-                f"first to build one (writes to {ENTANGLEMENT_DB_PATH}).")
+    db_projects = db["projects"] if db else {}
+
     lines = []
-    for name, info in sorted(db["projects"].items(), key=lambda kv: -kv[1]["chunk_count"]):
-        flag = "  [has unverified claims flagged]" if info.get("unsupported_claims") else ""
-        one_line = info["summary"].split(".")[0][:150] if info["summary"] else "(no summary)"
-        lines.append(f"{name} ({info['chunk_count']} chunks): {one_line}{flag}")
-    return "\n".join(lines)
+    for name, count in sorted(live_counts.items(), key=lambda kv: -kv[1]):
+        noise_tag = "  [non-project config/software]" if name.lower() in NON_PROJECT_HINTS else ""
+        info = db_projects.get(name)
+        if info is None:
+            lines.append(f"{name} ({count} chunks, live){noise_tag}: [not summarized -- entanglement DB is "
+                         f"stale or was never built for this project; run `python trit_entanglement.py`]")
+            continue
+        stale_tag = ""
+        if info.get("chunk_count") != count:
+            stale_tag = (f"  [STALE: entanglement DB has {info['chunk_count']} chunks for this project, "
+                         f"live index has {count} -- summary below may not reflect current content]")
+        claim_flag = "  [has unverified claims flagged]" if info.get("unsupported_claims") else ""
+        one_line = info["summary"].split(".")[0][:150] if info.get("summary") else "(no summary)"
+        lines.append(f"{name} ({count} chunks, live): {one_line}{claim_flag}{stale_tag}{noise_tag}")
+
+    if db is None:
+        lines.append("\n(No entanglement database found at all -- every project above is unsummarized. "
+                     f"Run `python trit_entanglement.py` to build one at {ENTANGLEMENT_DB_PATH}.)")
+
+    return "\n".join(lines) if lines else "No projects found in the live index."
 
 @experimental_tool
 @gated("get_project_summary")
