@@ -30,11 +30,23 @@ Usage (as an MCP server, e.g. in Claude Code's mcp config):
     }
   }
 """
+import os
 import sys
 import json
 import subprocess
 import threading
 from pathlib import Path
+
+# Must be set BEFORE the trit_app / observe_pipeline imports below, which
+# are what pull in sentence_transformers (lazily). Without this,
+# huggingface_hub makes a blocking network call to check for model updates
+# even for a purely local model_path -- measured 13+ min hang with
+# near-zero CPU vs 7.5s total once these are set. This is the MCP server's
+# own true entry point, so it's set here too (not just in trit_app.py) —
+# a fresh Claude session's first tool call must not hit the hang no matter
+# which module happens to import sentence_transformers first.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trit_app import SearchEngine
@@ -62,6 +74,7 @@ except ImportError:
         return gated, None, _NoopLimiter()
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 INDEX_DIR  = str(Path.home() / ".trit-search" / "index")
 MODEL_PATH = str(Path(__file__).resolve().parent / "models" / "code-minilm")
@@ -88,8 +101,22 @@ _limiter.set_limit("apply_and_verify", 20)  # the one tool that writes real file
 import os
 EXPERIMENTAL = os.environ.get("OBSERVE_EXPERIMENTAL", "") == "1"
 
-def experimental_tool(fn):
-    return mcp.tool()(fn) if EXPERIMENTAL else fn
+# MCP tool annotations (spec hints so a client knows which tools are safe to call freely).
+# Flagged by a third-party MCP trust assessment: OBSERVE declared none, so a client could not
+# tell search_code is read-only or that apply_and_verify can modify files. openWorldHint is False
+# everywhere — OBSERVE is local-only (even the LLM calls hit localhost ollama).
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False)
+_READ_ONLY_NONIDEMPOTENT = ToolAnnotations(
+    readOnlyHint=True, destructiveHint=False, idempotentHint=False, openWorldHint=False
+)
+_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False)
+
+
+def experimental_tool(*, annotations: ToolAnnotations | None = None):
+    def deco(fn):
+        return mcp.tool(annotations=annotations)(fn) if EXPERIMENTAL else fn
+
+    return deco
 
 import time
 
@@ -262,7 +289,7 @@ def _ensure_loaded():
             f"last status: \"{_status['msg']}\") -- try again shortly."
         )
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @gated("search_code")
 def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
     """
@@ -315,7 +342,7 @@ def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
         lines.append(f"   {r['preview'][:150]}")
     return "\n".join(lines)
 
-@experimental_tool
+@experimental_tool(annotations=_READ_ONLY)
 @gated("hybrid_search_code")
 def hybrid_search_code(query: str, k: int = 10, project: str = "", chunk_type: str = "",
                         path_glob: str = "", expand_graph: bool = False) -> str:
@@ -363,7 +390,7 @@ def hybrid_search_code(query: str, k: int = 10, project: str = "", chunk_type: s
                             path_glob=path_glob or None, expand_graph=expand_graph)
     return format_results(result)
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_NONIDEMPOTENT)
 @gated("query_codebase")
 def query_codebase(query: str, k: int = 8, project_dir: str = "") -> str:
     """
@@ -446,7 +473,7 @@ def _call_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 
 LOW_CONFIDENCE_THRESHOLD = 4.0   # below this top-score, treat search context as weak (see trit_cutoff_sweep_test.py for real score ranges)
 
-@experimental_tool
+@experimental_tool(annotations=_READ_ONLY_NONIDEMPOTENT)
 @gated("propose_change")
 def propose_change(request: str, project_dir: str = "", model: str = OLLAMA_MODEL) -> str:
     """
@@ -840,7 +867,7 @@ def _extract_current_state_pairs(text: str, window: int = 30) -> dict:
             pairs.setdefault(var, []).append(val)
     return pairs
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 @gated("index_status")
 def index_status() -> str:
     """
@@ -891,7 +918,34 @@ def _git_revert_file(repo_root: Path, path: Path) -> bool:
     except Exception:
         return False
 
-@experimental_tool
+def _indexed_base_dirs() -> set:
+    """Normalized, symlink-resolved base directories of everything currently indexed.
+
+    These are the only directories apply_and_verify is allowed to write into — the write
+    capability is bound to the corpus OBSERVE actually searches, nothing else on disk."""
+    roots = set()
+    for source in (getattr(engine, "path_table", None) or [], getattr(engine, "metadata", None) or []):
+        for entry in source:
+            base = entry.get("base_dir") if isinstance(entry, dict) else None
+            if base:
+                try:
+                    roots.add(os.path.normcase(os.path.realpath(base)))
+                except OSError:
+                    continue
+    return roots
+
+
+def _is_within_indexed_root(target: Path) -> bool:
+    """True iff `target` (symlinks resolved) is inside an indexed base dir. Fails closed:
+    no indexed roots -> no writable scope."""
+    roots = _indexed_base_dirs()
+    if not roots:
+        return False
+    resolved = os.path.normcase(os.path.realpath(str(target)))
+    return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
+
+
+@experimental_tool(annotations=_DESTRUCTIVE)
 @gated("apply_and_verify")
 def apply_and_verify(file_path: str, old_text: str, new_text: str) -> str:
     """
@@ -946,6 +1000,26 @@ def apply_and_verify(file_path: str, old_text: str, new_text: str) -> str:
     path = Path(file_path)
     if not path.exists():
         return f"FAILED — file does not exist: {file_path}"
+
+    # SECURITY: scope containment. apply_and_verify may only edit files inside a directory
+    # OBSERVE has actually indexed — never an arbitrary path on disk. Without this, a hostile
+    # indexed repo (OBSERVE's own stated threat) could drive the agent to overwrite ~/.ssh, a
+    # shell startup file, or a sitecustomize.py that later executes. realpath() resolves
+    # symlinks so a link planted inside an indexed dir cannot point the write outside it.
+    _ensure_loaded()
+    if _loaded["error"] or not _loaded["done"]:
+        return (
+            f"REFUSED — cannot verify edit scope because OBSERVE's index is not loaded "
+            f"({_loaded['error'] or _status['msg']}). apply_and_verify refuses rather than edit a "
+            f"file it cannot confirm lives inside an indexed project. No edit was applied."
+        )
+    if not _is_within_indexed_root(path):
+        return (
+            f"REFUSED — {file_path} is outside every indexed project directory. "
+            f"apply_and_verify only edits files OBSERVE has indexed; index the project first "
+            f"(trit_app.py INDEX CODEBASE) or target a file inside an indexed base directory. "
+            f"No edit was applied."
+        )
 
     repo_root = _find_git_root(path)
     backup_path = None
@@ -1043,7 +1117,7 @@ def _load_entanglement_db():
     except Exception:
         return None
 
-@experimental_tool
+@experimental_tool(annotations=_READ_ONLY)
 @gated("list_indexed_projects")
 def list_indexed_projects() -> str:
     """
@@ -1116,7 +1190,7 @@ def list_indexed_projects() -> str:
 
     return "\n".join(lines) if lines else "No projects found in the live index."
 
-@experimental_tool
+@experimental_tool(annotations=_READ_ONLY)
 @gated("get_project_summary")
 def get_project_summary(project_name: str) -> str:
     """
@@ -1155,7 +1229,7 @@ def get_project_summary(project_name: str) -> str:
             out.append(f"  - {c[:300]}")
     return "\n".join(out)
 
-@experimental_tool
+@experimental_tool(annotations=_READ_ONLY)
 @gated("get_entanglement")
 def get_entanglement(project_a: str, project_b: str) -> str:
     """
