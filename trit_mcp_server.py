@@ -192,8 +192,18 @@ _pending = {"attempt": None}   # holds the one AttemptState currently "live"
 STALL_ABANDON_LIMIT = 150   # real seconds since this attempt's last progress
                              # signal (not since it started) before treating
                              # it as genuinely wedged rather than slow
-PER_CALL_WAIT_CAP = 180     # a single tool call blocks polling at most this
-                             # long before returning control to the caller
+PER_CALL_WAIT_CAP = 8       # a single tool call blocks polling at most this
+                             # long before returning a fast "still warming,
+                             # retry shortly" instead of hanging the MCP client.
+                             # The engine is warmed in the background from
+                             # server startup (see main()), so by the time a
+                             # real query arrives it is usually already ready;
+                             # this cap only bounds the rare call that races
+                             # the cold load. Was 180 -- that long synchronous
+                             # block on the FIRST tool call (measured 25s warm,
+                             # ~55s+ cold, effectively forever if the native
+                             # faiss DLL load wedged) is exactly the hang users
+                             # hit; index_status now never blocks at all.
 MAX_SAME_PROCESS_RETRIES = 2   # after this many abandoned attempts, stop
                                  # retrying in-process and say so honestly
 
@@ -205,10 +215,25 @@ class _AttemptState:
 
 _retry_count = {"n": 0}
 
-def _ensure_loaded():
-    global engine
+def _start_load_if_needed():
+    """Kick off (at most) one background load attempt and return immediately.
+
+    This is the non-blocking half of the old _ensure_loaded: it starts the
+    heavy SearchEngine.load() (which itself runs on a daemon thread importing
+    sentence_transformers/faiss) but never waits for it. Safe to call
+    repeatedly and from multiple threads -- _load_lock guards the
+    check-and-start so two concurrent callers can't both launch a load.
+
+    Called once at server startup (main()) so the engine warms while the MCP
+    client is still doing its connect handshake, and also at the top of every
+    tool so a load still begins even if startup warm was somehow skipped.
+
+    Returns the live _AttemptState, or None if this process has given up
+    retrying in-process (retry cap exceeded) -- in which case _loaded["error"]
+    carries the explanation.
+    """
     if _loaded["done"]:
-        return
+        return _pending["attempt"]
 
     if _retry_count["n"] > MAX_SAME_PROCESS_RETRIES:
         _loaded["error"] = (
@@ -220,7 +245,7 @@ def _ensure_loaded():
             f"(kill it; your MCP client should respawn a clean one) -- "
             f"this is not something a code-level retry can fix."
         )
-        return
+        return None
 
     with _load_lock:
         if not _loaded["loading_started"]:
@@ -240,12 +265,40 @@ def _ensure_loaded():
             _loaded["loading_started"] = True
             _loaded["error"] = None
 
-    attempt = _pending["attempt"]
+    return _pending["attempt"]
+
+
+def _not_ready_message() -> str:
+    """Fast, non-hanging response for a tool called before the background
+    warm-up has finished (or when a load genuinely failed). Never blocks."""
+    return (
+        f"OBSERVE engine not ready yet: {_loaded['error'] or _status['msg']}. "
+        f"It warms in the background from server startup (a cold load imports "
+        f"sentence_transformers + faiss, ~55s on this machine). This call "
+        f"returned immediately instead of blocking the client -- retry in a "
+        f"few seconds; check index_status to see when it reports ready."
+    )
+
+
+def _ensure_loaded(max_wait=PER_CALL_WAIT_CAP):
+    """Ensure a load has started, then wait AT MOST max_wait seconds for it to
+    finish. Returns as soon as the engine is ready, or when max_wait elapses
+    (leaving _loaded["done"] False so the caller returns a fast warming
+    message), or when a genuinely-wedged attempt is abandoned. Pass
+    max_wait=0 for a pure non-blocking poll that still finalizes if ready."""
+    global engine
+    if _loaded["done"]:
+        return
+
+    attempt = _start_load_if_needed()
+    if attempt is None:   # gave up retrying in-process; _loaded["error"] set
+        return
+
     candidate = attempt.engine
     waited_this_call = 0.0
     while not candidate.ready:
         stalled_for = time.monotonic() - attempt.last_progress_ts
-        if stalled_for > STALL_ABANDON_LIMIT or waited_this_call >= PER_CALL_WAIT_CAP:
+        if stalled_for > STALL_ABANDON_LIMIT or waited_this_call >= max_wait:
             break
         time.sleep(0.5)
         waited_this_call += 0.5
@@ -327,8 +380,8 @@ def search_code(query: str, k: int = 10, project_dir: str = "") -> str:
         code previews, ranked by relevance (highest first).
     """
     _ensure_loaded()
-    if _loaded["error"]:
-        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+    if not _loaded["done"]:
+        return _not_ready_message()
 
     results = engine.search(query, k=k, base_dir_filter=project_dir or None)
     if not results:
@@ -383,8 +436,8 @@ def hybrid_search_code(query: str, k: int = 10, project: str = "", chunk_type: s
         hasn't been run yet.
     """
     _ensure_loaded()
-    if _loaded["error"]:
-        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+    if not _loaded["done"]:
+        return _not_ready_message()
     from hybrid_search import hybrid_search, format_results
     result = hybrid_search(engine, query, k=k, project=project or None, chunk_type=chunk_type or None,
                             path_glob=path_glob or None, expand_graph=expand_graph)
@@ -424,8 +477,8 @@ def query_codebase(query: str, k: int = 8, project_dir: str = "") -> str:
         One compact line per result: "path  score  preview".
     """
     _ensure_loaded()
-    if _loaded["error"]:
-        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+    if not _loaded["done"]:
+        return _not_ready_message()
 
     # over-fetch so dedup/filtering still has enough of a pool to choose from
     raw = engine.search(query, k=max(k * 4, 20), base_dir_filter=project_dir or None)
@@ -520,7 +573,7 @@ def propose_change(request: str, project_dir: str = "", model: str = OLLAMA_MODE
     _ensure_loaded()
     context = ""
     confidence_note = ""
-    if not _loaded["error"]:
+    if _loaded["done"]:
         results = engine.search(request, k=5, base_dir_filter=project_dir or None)
         if results:
             top_score = results[0]["score"]
@@ -875,11 +928,21 @@ def index_status() -> str:
     indexed, and which model is being used. Use this to check whether a
     search is likely to find anything before running search_code.
     """
-    _ensure_loaded()
-    if _loaded["error"]:
-        return f"Not ready: {_loaded['error']}"
-    n_chunks = len(engine.metadata)
-    return f"OBSERVE index ready — {n_chunks:,} chunks indexed, model: {MODEL_PATH}"
+    # Non-blocking: max_wait=0 starts/continues the background warm and
+    # finalizes if it's already done, but never waits -- index_status must
+    # answer instantly (it's the tool clients poll to find out IF a search
+    # is worth attempting, so it is the one that most must not hang).
+    _ensure_loaded(max_wait=0)
+    if _loaded["done"]:
+        n_chunks = len(engine.metadata)
+        return f"OBSERVE index ready — {n_chunks:,} chunks indexed, model: {MODEL_PATH}"
+    return (
+        f"OBSERVE index still warming (did not block) — last status: "
+        f"\"{_loaded['error'] or _status['msg']}\". The engine warms in the "
+        f"background from server startup; a cold load imports "
+        f"sentence_transformers + faiss (~55s on this machine). Call "
+        f"index_status again in a few seconds to see when it reports ready."
+    )
 
 GODOT_EXE = str(Path.home() / "Downloads" / "Godot_v4.6.2-stable_win64.exe" / "Godot_v4.6.2-stable_win64_console.exe")
 
@@ -1159,8 +1222,8 @@ def list_indexed_projects() -> str:
         "[not summarized]" flag rather than a wrong or missing answer.
     """
     _ensure_loaded()
-    if _loaded["error"]:
-        return f"Error: {_loaded['error']}. Build an index first with trit_app.py or trit_search.py --index."
+    if not _loaded["done"]:
+        return _not_ready_message()
 
     live_groups = group_chunks_by_project(engine)
     live_counts = {name: len(idxs) for name, idxs in live_groups.items()}
@@ -1282,6 +1345,14 @@ def get_entanglement(project_a: str, project_b: str) -> str:
     return "\n".join(lines)
 
 def main():
+    # Warm the engine in the background the moment the server starts, so the
+    # heavy sentence_transformers/faiss load overlaps the MCP client's connect
+    # handshake instead of being paid synchronously on the first tool call.
+    # This is the core of the cold-load-hang fix: _start_load_if_needed()
+    # returns immediately (the real work is on a daemon thread), so mcp.run()
+    # begins serving at once, and by the time a real query arrives the engine
+    # is usually already ready.
+    _start_load_if_needed()
     mcp.run(transport="stdio")
 
 if __name__ == "__main__":
