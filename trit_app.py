@@ -18,6 +18,15 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 import threading, subprocess, sys, os, json, time, random, webbrowser, queue, shutil
 from pathlib import Path
 
+# Must be set BEFORE sentence_transformers (imported lazily below, inside
+# SearchEngine.load()/build_index()) ever loads: huggingface_hub otherwise
+# makes a blocking network call to check for model updates even when
+# model_path is a purely local directory. Measured: 13+ minutes hung with
+# near-zero CPU vs 7.5s total once these are set. setdefault (not a hard
+# set) so a session that explicitly wants online mode can still override it.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # TERNARY BIT-PACKING
 # Packs 5 trits {-1,0,+1} into 1 byte (3^5=243 < 256) — true ~1.6 bits/value,
@@ -311,14 +320,45 @@ class SearchEngine:
                     })
         return results
 
-    def build_index(self, scan_dirs, index_dir, on_status, on_done):
+    def build_index(self, scan_dirs, index_dir, on_status, on_done,
+                    model_path=None, on_error=None):
+        # model_path lets a HEADLESS caller (no prior .load()) build from
+        # scratch; on_error is called with the exception if the build
+        # fails. BOTH completion paths (on_done OR on_error) ALWAYS fire --
+        # see the finalizer at the bottom of _build. REAL BUG THIS FIXES
+        # (measured 2026-11-05): build_index used to only print "Loading
+        # model..." without ever assigning self.model, so a headless build
+        # hit `self.model.encode()` -> AttributeError, which the bare
+        # `except` swallowed into a status string with NO on_done and NO
+        # ready flag -- every caller polling on_done / eng.ready then hung
+        # forever (confirmed: 180s, eng.ready=False, had to kill the proc).
         def _build():
+            err = None
             try:
-                import faiss, numpy as np
+                import numpy as np
                 from sentence_transformers import SentenceTransformer
+                # NOTE: faiss is deliberately NOT imported here -- the build
+                # path is pure-numpy (ternary pack + np.save), and the native
+                # faiss _swigfaiss.pyd LoadLibrary can WEDGE on this machine
+                # (AV + Windows loader-lock, see the MCP cold-load fix); there
+                # is no reason to risk that wedge on the build thread when
+                # faiss is never used to build.
 
                 if self.model is None:
-                    on_status("Loading model...")
+                    on_status("Loading model (first import ~55s on this machine)...")
+                    mp = model_path
+                    if mp is None:
+                        # Same resolution order as the GUI's _find_model():
+                        # fine-tuned local model first, then base fallback.
+                        for cand in (Path(__file__).parent / "models" / "code-minilm",
+                                     Path.home() / ".trit-search" / "models" / "code-minilm"):
+                            if cand.exists():
+                                mp = str(cand)
+                                break
+                        else:
+                            mp = "all-MiniLM-L6-v2"
+                    self.model = SentenceTransformer(mp)
+                    on_status("Model loaded.")
 
                 EXTS = {".py",".gd",".js",".ts",".cs",".rs",".go",
                         ".c",".cpp",".h",".java",".lua",".rb",".php",
@@ -346,12 +386,26 @@ class SearchEngine:
                     "Adobe", "Spotify",
                 }
 
-                chunks = []
+                files_by_real_path = {}   # real (normalized) file path -> {"base","rel","chunks"}
                 files  = 0
                 on_status("Scanning files...")
 
                 SKIP_PATTERNS = ("_files", "_assets")
 
+                # REAL BUG THIS PREVENTS (found + fixed 2026-09-14): scan_dirs
+                # entries commonly OVERLAP on this deployment (a project's own
+                # dir, its parent Documents folder, AND "C:/" are all listed
+                # in ~/.trit-search/config.json), so the same real file gets
+                # walked once per root that reaches it and used to be indexed
+                # once per (base_dir, rel_path) STRING pair -- textually
+                # different even though they're the same file. A live audit
+                # found 869 files double/triple-indexed this way (35,919
+                # duplicate chunk rows, ~23.6% of the whole index). Fixed by
+                # keying on the real normalized absolute path and keeping
+                # only the copy discovered under the MOST SPECIFIC (longest)
+                # scan_dir -- e.g. a project's own scan_dir wins over the
+                # "Documents" or "C:/" catch-all roots that also reach it,
+                # regardless of which order scan_dirs lists them in.
                 for base in scan_dirs:
                     for root, dirs, fnames in os.walk(base):
                         dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith(".")
@@ -360,6 +414,10 @@ class SearchEngine:
                             if Path(fname).suffix.lower() not in EXTS:
                                 continue
                             fpath = os.path.join(root, fname)
+                            real_key = os.path.normcase(os.path.normpath(fpath))
+                            existing = files_by_real_path.get(real_key)
+                            if existing is not None and len(existing["base"]) >= len(base):
+                                continue   # already have an equally- or more-specific copy of this real file
                             try:
                                 text = open(fpath, encoding="utf-8", errors="ignore").read()
                                 if len(text.strip()) < 100:
@@ -368,20 +426,36 @@ class SearchEngine:
                                 # Chunk — store only path + offset, not the
                                 # full text/preview (regenerated lazily on
                                 # display from the original file on disk).
+                                file_chunks = []
                                 for i in range(0, len(text), 700):
                                     chunk = text[i:i+800]
                                     if len(chunk.strip()) > 50:
-                                        chunks.append({
+                                        file_chunks.append({
                                             "text":     f"file:{rel}\n{chunk}",
                                             "rel_path": rel,
                                             "base_dir": base,
                                             "offset":   i,
                                         })
-                                files += 1
+                                if existing is None:
+                                    files += 1   # only count a real file once, even if replaced below
+                                    if files % 200 == 0:
+                                        on_status(f"Scanning files... {files:,} found")
+                                files_by_real_path[real_key] = {"base": base, "rel": rel, "chunks": file_chunks}
                             except: pass
 
-                on_status(f"Encoding {len(chunks):,} chunks from {files:,} files...")
+                chunks = [c for entry in files_by_real_path.values() for c in entry["chunks"]]
+
                 os.makedirs(index_dir, exist_ok=True)
+
+                # No matching source files under scan_dirs -- complete
+                # gracefully (an empty np.vstack would otherwise raise and,
+                # before the always-fire finalizer below, hang the caller).
+                if not chunks:
+                    on_status(f"No indexable files found in {scan_dirs} "
+                              f"(scanned {files:,} files).")
+                    return
+
+                on_status(f"Encoding {len(chunks):,} chunks from {files:,} files...")
 
                 texts = [c["text"] for c in chunks]
                 bs    = 128
@@ -438,9 +512,28 @@ class SearchEngine:
                 on_status(f"Index complete — {len(chunks):,} chunks, {files:,} files "
                           f"({size_mb:.2f}MB packed-ternary vs {float_mb:.2f}MB float32, "
                           f"{float_mb/size_mb:.1f}x smaller)")
-                on_done()
             except Exception as e:
+                import traceback
+                err = e
                 on_status(f"Index error: {e}")
+                traceback.print_exc()
+            # ALWAYS-FIRE FINALIZER: exactly one of on_done / on_error runs,
+            # no matter what happened above (success, exception, or an early
+            # `return` for the empty-chunks case). Before this, a failure left
+            # on_done uncalled and the caller polling forever -- the measured
+            # root cause of the external-dir build hang (2026-11-05). Each
+            # callback is itself guarded so a raising callback (e.g. a status
+            # codec error) can't resurrect the hang.
+            if err is None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+            elif on_error is not None:
+                try:
+                    on_error(err)
+                except Exception:
+                    pass
         threading.Thread(target=_build, daemon=True).start()
 
 
@@ -951,12 +1044,18 @@ class TritSearchApp:
         self.engine.build_index(
             self.scan_dirs, self.index_dir,
             on_status=self._set_status,
-            on_done=self._on_index_done
+            on_done=self._on_index_done,
+            model_path=self.model_path,
+            on_error=self._on_index_error,
         )
 
     def _on_index_done(self):
         self.root.after(0, lambda: self.index_btn.config(state="normal"))
         self.root.after(0, self._update_stats)
+
+    def _on_index_error(self, exc):
+        # Never leave the INDEX button stuck disabled after a failed build.
+        self.root.after(0, lambda: self.index_btn.config(state="normal"))
 
     def _open_browser(self):
         webbrowser.open(f"http://localhost:5050")
